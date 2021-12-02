@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
+	"os"
 	raft "raft-go"
-	"time"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 )
@@ -21,7 +23,7 @@ func main() {
 		net.Net[id] = nodes[index]
 	}
 
-	server := raft.NewServer(net)
+	server := raft.NewServer(net, raft.Cluster{Nodes: nodes})
 
 	for _, node := range nodes {
 		node.SetServer(server)
@@ -31,7 +33,33 @@ func main() {
 		go node.Start()
 	}
 
-	time.Sleep(time.Minute)
+	reader := bufio.NewReader(os.Stdin)
+
+	for {
+		fmt.Print("-> ")
+		text, _ := reader.ReadString('\n')
+		// convert CRLF to LF
+		text = strings.Replace(text, "\n", "", -1)
+
+		if text == "exit" {
+			return
+		}
+
+		if text == "print" {
+			server.Print()
+		}
+
+		split := strings.Split(text, " ")
+		if split[0] == "append" {
+			v := raft.Value(split[2])
+			switch split[1] {
+			case "add":
+				server.ExternalRequest(v)
+			case "delete":
+				fmt.Print("implement")
+			}
+		}
+	}
 }
 
 func removeIndex(s []int, index int) []int {

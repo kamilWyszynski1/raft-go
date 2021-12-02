@@ -4,6 +4,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gofrs/uuid"
+
 	"github.com/sirupsen/logrus"
 )
 
@@ -63,16 +65,19 @@ type Node struct {
 	votedFor int
 
 	lcch LeaderCommunicationChan
+
+	toBeCommitted map[uuid.UUID]AddEntry
 }
 
 func NewNode(id int, logger *logrus.Logger, peerIds []int) *Node {
 	return &Node{
-		logger:     logger.WithField("id", id),
-		id:         id,
-		peerIds:    peerIds,
-		state:      Follower,
-		timeout:    timeoutDuration,
-		logContent: NewSimpleLL(),
+		logger:        logger.WithField("id", id),
+		id:            id,
+		peerIds:       peerIds,
+		state:         Follower,
+		timeout:       timeoutDuration,
+		logContent:    NewSimpleLL(),
+		toBeCommitted: make(map[uuid.UUID]AddEntry),
 	}
 }
 
@@ -84,7 +89,48 @@ func (n *Node) SetLeaderCommunicationChan(lcch LeaderCommunicationChan) {
 	n.lcch = lcch
 }
 
-func (n *Node) AppendEntries(term, leaderID int) (success bool, replyTerm int) {
+// HandleExternalRequest takes request from server. Is only called when Node is leader.
+// It's mocked way of allowing external traffic to cluster.
+func (n *Node) HandleExternalRequest(v Value) {
+	n.mtx.Lock()
+	defer n.mtx.Unlock()
+
+	logger := n.logger.WithField("method", "HandleExternalRequest")
+	entriesMap := make(map[int]uuid.UUID)
+
+	localEntryID := uuid.Must(uuid.NewV4())
+	n.toBeCommitted[localEntryID] = AddEntry{
+		ID:           localEntryID,
+		Value:        v,
+		AddEntryType: Add,
+	}
+
+	for _, peerID := range n.peerIds {
+		entryID := uuid.Must(uuid.NewV4())
+		entriesMap[peerID] = entryID
+		success, _ := n.server.AppendEntries(n.id, peerID, n.term, AddEntry{
+			ID:           entryID,
+			Value:        v,
+			AddEntryType: Add,
+		})
+		if !success {
+			logger.Info("AppendEntries for AddEntry failed, skipping")
+		}
+	}
+	n.commitLog(localEntryID)
+
+	for peerID, entryID := range entriesMap {
+		success, _ := n.server.AppendEntries(n.id, peerID, n.term, CommitEntry{
+			ID: entryID,
+		})
+		if !success {
+			logger.Info("AppendEntries for CommitEntry failed, skipping")
+		}
+	}
+}
+
+// AppendEntries method used for consensus algorithm as well as for setting state of Node.
+func (n *Node) AppendEntries(term, leaderID int, entry Entry) (success bool, replyTerm int) {
 	logger := n.logger.WithFields(logrus.Fields{
 		"method":    "AppendEntries",
 		"term":      term,
@@ -110,7 +156,35 @@ func (n *Node) AppendEntries(term, leaderID int) (success bool, replyTerm int) {
 		success = true
 	}
 	replyTerm = n.term
+
+	// handle entry.
+	if entry != nil {
+		switch entry.Type() {
+		case Append:
+			body := entry.Body().(AddEntry)
+			n.toBeCommitted[body.ID] = body
+		case Commit:
+			entryID := entry.Body().(uuid.UUID)
+			n.commitLog(entryID)
+		case Print:
+			logger.Info(n.logContent.String())
+		}
+	}
 	return
+}
+
+// commitLog commits uncommitted Entry to log content.
+func (n *Node) commitLog(entryID uuid.UUID) {
+	defer delete(n.toBeCommitted, entryID)
+
+	entry := n.toBeCommitted[entryID]
+
+	switch entry.AddEntryType {
+	case Add:
+		n.logContent.Add(entry.Value)
+	case Delete:
+		panic("IMPLEMENT DELETE ADD ENTRY")
+	}
 }
 
 func (n *Node) RequestVote(fromID, term int) (bool, int) {
@@ -269,7 +343,26 @@ func (n *Node) sendHeartBeat() {
 
 	for _, to := range n.peerIds {
 		go func(to int) {
-			_, replyTerm := n.server.AppendEntries(n.id, to, savedCurrentTerm)
+			_, replyTerm := n.server.AppendEntries(n.id, to, savedCurrentTerm, nil)
+			n.mtx.Lock()
+			defer n.mtx.Unlock()
+			if replyTerm > savedCurrentTerm {
+				n.becomeFollower(replyTerm)
+			}
+		}(to)
+	}
+}
+
+// Print orders print.
+func (n *Node) Print() {
+	n.mtx.Lock()
+	savedCurrentTerm := n.term
+	defer n.mtx.Unlock()
+
+	n.logger.Print(n.logContent.String()) // leader print.
+	for _, to := range n.peerIds {
+		go func(to int) {
+			_, replyTerm := n.server.AppendEntries(n.id, to, savedCurrentTerm, PrintEntry{})
 			n.mtx.Lock()
 			defer n.mtx.Unlock()
 			if replyTerm > savedCurrentTerm {
